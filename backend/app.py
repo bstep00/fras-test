@@ -1,13 +1,16 @@
 from flask import Flask, request, jsonify
 import base64
 import cv2
+import datetime
+import ipaddress
+import math
 import numpy as np
+import os
+
 import firebase_admin
 from firebase_admin import credentials, firestore, storage
-import datetime
-import os
 from deepface import DeepFace
-from zoneinfo import ZoneInfo  
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
@@ -34,6 +37,60 @@ bucket = storage.bucket()  # Initialize storage bucket
 
 # Timezone for Central Time
 CENTRAL_TZ = ZoneInfo("America/Chicago")
+
+
+def _load_allowed_networks():
+    cidr_list = os.getenv(
+        "ALLOWED_IP_RANGES",
+        "129.120.0.0/16, 129.120.64.0/18, 129.120.96.0/19, 129.120.112.0/20"
+    )
+    networks = []
+    for cidr in cidr_list.split(","):
+        cidr = cidr.strip()
+        if not cidr:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+ALLOWED_NETWORKS = _load_allowed_networks()
+PENDING_MINUTES = int(os.getenv("ATTENDANCE_PENDING_MINUTES", "45"))
+
+
+def get_client_ip(req):
+    header_value = req.headers.get("X-Forwarded-For")
+    ip_str = None
+    if header_value:
+        ip_str = header_value.split(",")[0].strip()
+    if not ip_str:
+        ip_str = req.remote_addr
+    return ip_str or ""
+
+
+def normalize_ip(ip_str):
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
+        ip_obj = ip_obj.ipv4_mapped
+    return ip_obj
+
+
+def is_ip_allowed(ip_str):
+    if not ALLOWED_NETWORKS:
+        return True
+    ip_obj = normalize_ip(ip_str)
+    if ip_obj is None:
+        return False
+    for network in ALLOWED_NETWORKS:
+        if ip_obj in network:
+            return True
+    return False
+
 
 def parse_time_12h(timestr):
     
@@ -84,6 +141,13 @@ def face_recognition():
     temp_known_path = "temp_known_face.jpg"
 
     try:
+        client_ip = get_client_ip(request)
+        if not is_ip_allowed(client_ip):
+            return jsonify({
+                "status": "forbidden",
+                "message": "Attendance can only be recorded while connected to the UNT EagleNet network."
+            }), 403
+
         data = request.get_json()
         image_b64 = data.get("image")
         class_id = data.get("classId")
@@ -138,6 +202,21 @@ def face_recognition():
         # Check if attendance record already exists
         attendance_doc = db.collection("attendance").document(doc_id).get()
         if attendance_doc.exists:
+            existing_data = attendance_doc.to_dict()
+            if existing_data.get("status") == "Pending":
+                pending_until = existing_data.get("pendingExpiresAt")
+                if isinstance(pending_until, datetime.datetime):
+                    remaining_seconds = max((pending_until - now_central).total_seconds(), 0)
+                else:
+                    remaining_seconds = PENDING_MINUTES * 60
+                return jsonify({
+                    "status": "pending",
+                    "message": "Attendance is already pending final confirmation.",
+                    "attendance_status": existing_data.get("pendingFinalStatus"),
+                    "pending_minutes": math.ceil(remaining_seconds / 60),
+                    "pending_seconds": int(remaining_seconds),
+                    "doc_id": doc_id,
+                }), 200
             return jsonify({"status": "already_marked", "message": "Attendance already recorded today."}), 200
 
         # Retrieve class document to fetch the class schedule
@@ -170,20 +249,34 @@ def face_recognition():
 
         print("Computed attendance status:", status)
         # Create attendance record document in Firebase
+        pending_expires_at = now_central + datetime.timedelta(minutes=PENDING_MINUTES)
         attendance_record = {
             "studentID": student_id,
             "classID": class_id,
             "date": now_central,
-            "status": status,
+            "status": "Pending",
+            "pendingFinalStatus": status,
+            "pendingStartedAt": now_central,
+            "pendingExpiresAt": pending_expires_at,
+            "pendingDurationMinutes": PENDING_MINUTES,
+            "initialCheckIp": client_ip,
+            "verificationMetrics": {
+                "distance": verify_result.get("distance"),
+                "threshold": verify_result.get("max_threshold_to_verify"),
+            },
         }
         db.collection("attendance").document(doc_id).set(attendance_record)
         # Data from successful scan
         return jsonify({
-            "status": "success",
+            "status": "pending",
             "recognized_student": student_id,
             "attendance_status": status,
             "distance": verify_result.get("distance"),
-            "threshold": verify_result.get("max_threshold_to_verify")
+            "threshold": verify_result.get("max_threshold_to_verify"),
+            "pending_minutes": PENDING_MINUTES,
+            "pending_seconds": PENDING_MINUTES * 60,
+            "doc_id": doc_id,
+            "message": "Attendance recorded as pending. Keep the application open for 45 minutes so we can confirm you remain on EagleNet.",
         }), 200
 
     except Exception as e:
@@ -195,6 +288,82 @@ def face_recognition():
             os.remove(temp_captured_path)
         if os.path.exists(temp_known_path):
             os.remove(temp_known_path)
+
+
+@app.route("/api/attendance/finalize", methods=["POST", "OPTIONS"])
+def finalize_attendance():
+    if request.method == "OPTIONS":
+        return "", 200
+
+    try:
+        client_ip = get_client_ip(request)
+        data = request.get_json() or {}
+        class_id = data.get("classId")
+        student_id = data.get("studentId")
+
+        if not class_id or not student_id:
+            return jsonify({
+                "status": "error",
+                "message": "Missing classId or studentId"
+            }), 400
+
+        now_central = datetime.datetime.now(CENTRAL_TZ)
+        today_str = now_central.strftime("%Y-%m-%d")
+        doc_id = f"{class_id}_{student_id}_{today_str}"
+        attendance_ref = db.collection("attendance").document(doc_id)
+        attendance_doc = attendance_ref.get()
+
+        if not attendance_doc.exists:
+            return jsonify({
+                "status": "error",
+                "message": "No pending attendance record found for this class and student."
+            }), 404
+
+        record = attendance_doc.to_dict()
+        if record.get("status") != "Pending":
+            return jsonify({
+                "status": "error",
+                "message": "Attendance is already finalized.",
+                "current_status": record.get("status")
+            }), 400
+
+        pending_until = record.get("pendingExpiresAt")
+        if isinstance(pending_until, datetime.datetime) and now_central < pending_until:
+            seconds_remaining = max((pending_until - now_central).total_seconds(), 0)
+            return jsonify({
+                "status": "pending",
+                "message": "Attendance finalization is not ready yet.",
+                "pending_seconds": int(seconds_remaining),
+                "pending_minutes": math.ceil(seconds_remaining / 60),
+            }), 200
+
+        if not is_ip_allowed(client_ip):
+            attendance_ref.update({
+                "status": "Rejected",
+                "finalizedAt": now_central,
+                "finalizedIp": client_ip,
+                "rejectionReason": "Client not connected to approved network during final confirmation.",
+            })
+            return jsonify({
+                "status": "denied",
+                "message": "Attendance could not be finalized because you are no longer on the EagleNet network.",
+            }), 403
+
+        final_status = record.get("pendingFinalStatus", "Present")
+        attendance_ref.update({
+            "status": final_status,
+            "finalizedAt": now_central,
+            "finalizedIp": client_ip,
+        })
+        return jsonify({
+            "status": "success",
+            "final_status": final_status,
+            "message": "Attendance finalized successfully."
+        }), 200
+
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
