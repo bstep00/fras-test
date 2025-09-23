@@ -8,11 +8,11 @@ __pycache__/
 
 # Ignore environment variables and credentials
 .env
-config.py
+#config.py
 instance/
 firebase-adminsdk.json
-frontend/src/firebaseConfig.js
-backend/firebase/firebase_credentials.json
+#frontend/src/firebaseConfig.js
+#backend/firebase/firebase_credentials.json
 
 
 # Ignore logs
